@@ -4,10 +4,20 @@
 
 #include "MediaControlService.h"
 
+#ifdef XP_WIN
+#  include <process.h>
+#  ifndef getpid
+#    define getpid _getpid
+#  endif
+#else
+#  include <unistd.h>
+#endif
+
 #include "MediaControlUtils.h"
 #include "MediaController.h"
 #include "mozilla/AppShutdown.h"
 #include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
 #include "mozilla/Logging.h"
 #include "mozilla/Services.h"
 #include "mozilla/StaticPrefs_media.h"
@@ -32,6 +42,17 @@ using mozilla::intl::Localization;
   MOZ_LOG(gMediaControlLog, LogLevel::Info, (msg, ##__VA_ARGS__))
 
 namespace mozilla::dom {
+
+const LinkedList<RefPtr<MediaController>>&
+MediaControlService::ControllerManager::GetControllers() const {
+  return mControllers;
+}
+
+MediaController* MediaControlService::GetControllerByTabId(
+    uint64_t tabId) const {
+  MOZ_DIAGNOSTIC_ASSERT(mControllerManager);
+  return mControllerManager->GetControllerById(tabId);
+}
 
 StaticRefPtr<MediaControlService> gMediaControlService;
 
@@ -109,8 +130,6 @@ MediaControlService::MediaControlService() {
 
 void MediaControlService::Init() {
   mMediaKeysHandler = new MediaControlKeyHandler();
-  mMediaControlKeyManager = new MediaControlKeyManager();
-  mMediaControlKeyManager->AddListener(mMediaKeysHandler.get());
   mControllerManager = MakeUnique<ControllerManager>(this);
 
   // Initialize the fallback title
@@ -151,8 +170,13 @@ MediaControlService::Observe(nsISupports* aSubject, const char* aTopic,
 }
 
 void MediaControlService::Shutdown() {
+  for (auto& entry : mTabManagers) {
+    if (entry.second) {
+      entry.second->Close();
+    }
+  }
+  mTabManagers.clear();
   mControllerManager->Shutdown();
-  mMediaControlKeyManager->RemoveListener(mMediaKeysHandler.get());
 }
 
 bool MediaControlService::RegisterActiveMediaController(
@@ -162,6 +186,18 @@ bool MediaControlService::RegisterActiveMediaController(
   if (!mControllerManager->AddController(aController)) {
     LOG("Fail to register controller %" PRId64, aController->Id());
     return false;
+  }
+  // Per-tab MPRIS: create a manager/service for this tab if not present
+  uint64_t tabId = aController->Id();
+  if (!mTabManagers.count(tabId)) {
+    static mozilla::Atomic<uint32_t> sInstanceId(0);
+    if (sInstanceId == 0) {
+      sInstanceId = static_cast<uint32_t>(getpid());
+    }
+    RefPtr<MediaControlKeyManager> manager =
+        new MediaControlKeyManager(tabId, sInstanceId);
+    manager->Open();
+    mTabManagers[tabId] = manager;
   }
   LOG("Register media controller %" PRId64 ", currentNum=%" PRId64,
       aController->Id(), GetActiveControllersNum());
@@ -180,6 +216,13 @@ bool MediaControlService::UnregisterActiveMediaController(
   if (!mControllerManager->RemoveController(aController)) {
     LOG("Fail to unregister controller %" PRId64, aController->Id());
     return false;
+  }
+  // Per-tab MPRIS: destroy the manager/service for this tab
+  uint64_t tabId = aController->Id();
+  auto it = mTabManagers.find(tabId);
+  if (it != mTabManagers.end()) {
+    it->second->Close();
+    mTabManagers.erase(it);
   }
   LOG("Unregister media controller %" PRId64 ", currentNum=%" PRId64,
       aController->Id(), GetActiveControllersNum());
@@ -202,23 +245,15 @@ void MediaControlService::NotifyControllerPlaybackStateChanged(
     return;
   }
 
-  // The controller is the main controller, propagate its playback state.
-  if (GetMainController() == aController) {
-    mControllerManager->MainControllerPlaybackStateChanged(
-        aController->PlaybackState());
-    return;
+  uint64_t tabId = aController->Id();
+  auto it = mTabManagers.find(tabId);
+  if (it != mTabManagers.end()) {
+    it->second->SetPlaybackState(aController->PlaybackState());
+    it->second->SetMediaMetadata(aController->GetCurrentMediaMetadata());
+    it->second->SetSupportedMediaKeys(aController->GetSupportedMediaKeys());
+    it->second->SetPositionState(aController->GetCurrentPositionState());
   }
-
-  // The controller is not the main controller, but will become a new main
-  // controller. As the service can contains multiple controllers and only one
-  // controller can be controlled by media control keys. Therefore, when
-  // controller's state becomes `playing`, then we would like to let that
-  // controller being controlled, rather than other controller which might not
-  // be playing at the time.
-  if (GetMainController() != aController &&
-      aController->PlaybackState() == MediaSessionPlaybackState::Playing) {
-    mControllerManager->UpdateMainControllerIfNeeded(aController);
-  }
+  // No propagation of main controller state to other managers.
 }
 
 void MediaControlService::RequestUpdateMainController(
@@ -289,10 +324,7 @@ nsString MediaControlService::GetFallbackTitle() const {
 
 // Following functions belong to ControllerManager
 MediaControlService::ControllerManager::ControllerManager(
-    MediaControlService* aService)
-    : mSource(aService->GetMediaControlKeySource()) {
-  MOZ_ASSERT(mSource);
-}
+    MediaControlService* aService) {}
 
 bool MediaControlService::ControllerManager::AddController(
     MediaController* aController) {
@@ -301,6 +333,7 @@ bool MediaControlService::ControllerManager::AddController(
     return false;
   }
   mControllers.insertBack(aController);
+  mControllerMap[aController->Id()] = aController;
   UpdateMainControllerIfNeeded(aController);
   return true;
 }
@@ -311,6 +344,7 @@ bool MediaControlService::ControllerManager::RemoveController(
   if (!mControllers.contains(aController)) {
     return false;
   }
+  mControllerMap.erase(aController->Id());
   // This is LinkedListElement's method which will remove controller from
   // `mController`.
   static_cast<LinkedListControllerPtr>(aController)->remove();
@@ -386,104 +420,30 @@ void MediaControlService::ControllerManager::ReorderGivenController(
 
 void MediaControlService::ControllerManager::Shutdown() {
   mControllers.clear();
+  mControllerMap.clear();
   DisconnectMainControllerEvents();
-}
-
-void MediaControlService::ControllerManager::MainControllerPlaybackStateChanged(
-    MediaSessionPlaybackState aState) {
-  MOZ_ASSERT(NS_IsMainThread());
-  mSource->SetPlaybackState(aState);
-}
-
-void MediaControlService::ControllerManager::MainControllerMetadataChanged(
-    const MediaMetadataBase& aMetadata) {
-  MOZ_ASSERT(NS_IsMainThread());
-  mSource->SetMediaMetadata(aMetadata);
 }
 
 void MediaControlService::ControllerManager::UpdateMainControllerInternal(
     MediaController* aController) {
-  MOZ_ASSERT(NS_IsMainThread());
-  if (aController) {
-    aController->Select();
-  }
-  if (mMainController) {
-    mMainController->Unselect();
-  }
   mMainController = aController;
-
-  if (!mMainController) {
-    LOG_MAINCONTROLLER_INFO("Clear main controller");
-    mSource->Close();
-    DisconnectMainControllerEvents();
-  } else {
-    LOG_MAINCONTROLLER_INFO("Set controller %" PRId64 " as main controller",
-                            mMainController->Id());
-    if (!mSource->Open()) {
-      LOG("Failed to open source for monitoring media keys");
-    }
-    // We would still update those status to the event source even if it failed
-    // to open, because it would save the result and set them to the real
-    // source when it opens. In addition, another benefit to do that is to
-    // prevent testing from affecting by platform specific issues, because our
-    // testing events rely on those status changes and they are all platform
-    // independent.
-    mSource->SetPlaybackState(mMainController->PlaybackState());
-    mSource->SetMediaMetadata(mMainController->GetCurrentMediaMetadata());
-    mSource->SetSupportedMediaKeys(mMainController->GetSupportedMediaKeys());
-    mSource->SetPositionState(mMainController->GetCurrentPositionState());
-    ConnectMainControllerEvents();
-  }
-
-  if (StaticPrefs::media_mediacontrol_testingevents_enabled()) {
-    if (nsCOMPtr<nsIObserverService> obs = services::GetObserverService()) {
-      obs->NotifyObservers(nullptr, "main-media-controller-changed", nullptr);
-    }
+  if (nsCOMPtr<nsIObserverService> obs = services::GetObserverService()) {
+    obs->NotifyObservers(nullptr, "main-media-controller-changed", nullptr);
   }
 }
-
-void MediaControlService::ControllerManager::ConnectMainControllerEvents() {
-  // As main controller has been changed, we should disconnect listeners from
-  // the previous controller and reconnect them to the new controller.
-  DisconnectMainControllerEvents();
-  // Listen to main controller's event in order to propagate the content that
-  // might be displayed on the virtual control interface created by the source.
-  mMetadataChangedListener = mMainController->MetadataChangedEvent().Connect(
-      AbstractThread::MainThread(), this,
-      &ControllerManager::MainControllerMetadataChanged);
-  mSupportedKeysChangedListener =
-      mMainController->SupportedKeysChangedEvent().Connect(
-          AbstractThread::MainThread(),
-          [this](const MediaKeysArray& aSupportedKeys) {
-            mSource->SetSupportedMediaKeys(aSupportedKeys);
-          });
-  mFullScreenChangedListener =
-      mMainController->FullScreenChangedEvent().Connect(
-          AbstractThread::MainThread(), [this](bool aIsEnabled) {
-            mSource->SetEnableFullScreen(aIsEnabled);
-          });
-  mPictureInPictureModeChangedListener =
-      mMainController->PictureInPictureModeChangedEvent().Connect(
-          AbstractThread::MainThread(), [this](bool aIsEnabled) {
-            mSource->SetEnablePictureInPictureMode(aIsEnabled);
-          });
-  mPositionChangedListener = mMainController->PositionChangedEvent().Connect(
-      AbstractThread::MainThread(), [this](const Maybe<PositionState>& aState) {
-        mSource->SetPositionState(aState);
-      });
-}
-
 void MediaControlService::ControllerManager::DisconnectMainControllerEvents() {
-  mMetadataChangedListener.DisconnectIfExists();
-  mSupportedKeysChangedListener.DisconnectIfExists();
-  mFullScreenChangedListener.DisconnectIfExists();
-  mPictureInPictureModeChangedListener.DisconnectIfExists();
-  mPositionChangedListener.DisconnectIfExists();
+  // No-op in single-instance logic
 }
 
 MediaController* MediaControlService::ControllerManager::GetMainController()
     const {
   return mMainController.get();
+}
+
+MediaController* MediaControlService::ControllerManager::GetControllerById(
+    uint64_t aTabId) const {
+  auto it = mControllerMap.find(aTabId);
+  return it != mControllerMap.end() ? it->second : nullptr;
 }
 
 uint64_t MediaControlService::ControllerManager::GetControllersNum() const {

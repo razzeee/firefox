@@ -57,9 +57,10 @@ class MPRISServiceHandler final : public dom::MediaControlKeySource {
   // Note that this constructor does NOT initialize the MPRIS Service but only
   // this class. The method Open() is responsible for registering and MAY FAIL.
 
-  MPRISServiceHandler();
+  MPRISServiceHandler(uint32_t aInstanceId, uint32_t aTabId);
   bool Open() override;
   void Close() override;
+  void SetConnection(GDBusConnection* aConnection);
   bool IsOpened() const override;
 
   // From the EventSource.
@@ -195,8 +196,14 @@ class MPRISServiceHandler final : public dom::MediaControlKeySource {
   RefPtr<GCancellable> mDBusGetCancellable;
 
   nsCString mServiceName;
-  void SetServiceName(const char* aName);
-  const char* GetServiceName();
+  void SetServiceIdentity();
+  const char* GetServiceName() const;
+
+  nsCString mTrackPath;
+  const char* GetTrackPath() const;
+
+  uint32_t mInstanceId;
+  uint32_t mTabId;
 };
 
 }  // namespace widget

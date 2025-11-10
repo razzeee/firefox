@@ -343,46 +343,23 @@ void MPRISServiceHandler::OnBusAcquired(GDBusConnection* aConnection,
   }
 }
 
-void MPRISServiceHandler::SetServiceName(const char* aName) {
-  nsCString dbusName(aName);
-  dbusName.ReplaceChar(':', '_');
-  dbusName.ReplaceChar('.', '_');
-  mServiceName =
-      nsCString(DBUS_MPRIS_SERVICE_NAME) + nsCString(".instance") + dbusName;
+void MPRISServiceHandler::SetServiceIdentity() {
+  mServiceName = nsPrintfCString("%s.instance%u_tab%u", DBUS_MPRIS_SERVICE_NAME,
+                                 mInstanceId, mTabId);
+  mTrackPath = nsPrintfCString("%s/instance%u/tab%u", DBUS_MPRIS_TRACK_PATH,
+                               mInstanceId, mTabId);
 }
 
-const char* MPRISServiceHandler::GetServiceName() { return mServiceName.get(); }
+const char* MPRISServiceHandler::GetServiceName() const {
+  return mServiceName.get();
+}
 
-/* static */
-void g_bus_get_callback(GObject* aSourceObject, GAsyncResult* aRes,
-                        gpointer aUserData) {
-  GUniquePtr<GError> error;
-
-  GDBusConnection* conn = g_bus_get_finish(aRes, getter_Transfers(error));
-  if (!conn) {
-    if (!IsCancelledGError(error.get())) {
-      NS_WARNING(nsPrintfCString("Failure at g_bus_get_finish: %s",
-                                 error ? error->message : "Unknown Error")
-                     .get());
-    }
-    return;
-  }
-
-  MPRISServiceHandler* handler = static_cast<MPRISServiceHandler*>(aUserData);
-  if (!handler) {
-    NS_WARNING(
-        nsPrintfCString("Failure to get a MPRISServiceHandler*: %p", handler)
-            .get());
-    return;
-  }
-
-  handler->OwnName(conn);
+const char* MPRISServiceHandler::GetTrackPath() const {
+  return mTrackPath.get();
 }
 
 void MPRISServiceHandler::OwnName(GDBusConnection* aConnection) {
   MOZ_ASSERT(NS_IsMainThread());
-
-  SetServiceName(g_dbus_connection_get_unique_name(aConnection));
 
   GUniquePtr<GError> error;
 
@@ -411,16 +388,76 @@ bool MPRISServiceHandler::Open() {
   MOZ_ASSERT(!mInitialized);
   MOZ_ASSERT(NS_IsMainThread());
 
+  SetServiceIdentity();
+  LOGMPRIS("Open: tabId=%u, ServiceName=%s, ObjectPath=%s", mTabId,
+           mServiceName.get(), DBUS_MPRIS_OBJECT_PATH);
+
   mDBusGetCancellable = dont_AddRef(g_cancellable_new());
-  g_bus_get(G_BUS_TYPE_SESSION, mDBusGetCancellable, g_bus_get_callback, this);
+  GError* error = nullptr;
+  gchar* address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION,
+                                                   mDBusGetCancellable, &error);
+  if (!address) {
+    LOGMPRIS("Failed to get session bus address: %s",
+             error ? error->message : "Unknown Error");
+    if (error) {
+      g_error_free(error);
+    }
+    return false;
+  }
+
+  RefPtr<MPRISServiceHandler> self(this);
+  g_dbus_connection_new_for_address(
+      address,
+      (GDBusConnectionFlags)(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+                             G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+      nullptr,  // GDBusAuthObserver*
+      mDBusGetCancellable,
+      [](GObject* source_object, GAsyncResult* res, gpointer user_data) {
+        GError* error = nullptr;
+        GDBusConnection* conn =
+            g_dbus_connection_new_for_address_finish(res, &error);
+
+        RefPtr<MPRISServiceHandler> handler =
+            already_AddRefed<MPRISServiceHandler>(
+                static_cast<MPRISServiceHandler*>(user_data));
+
+        if (!conn) {
+          NS_WARNING(
+              nsPrintfCString(
+                  "Failure at g_dbus_connection_new_for_address_finish: %s",
+                  error ? error->message : "Unknown Error")
+                  .get());
+          if (error) {
+            g_error_free(error);
+          }
+          return;
+        }
+        if (!handler) {
+          NS_WARNING(
+              "Failure to get a MPRISServiceHandler* in new_for_address "
+              "callback");
+          g_object_unref(conn);
+          return;
+        }
+        handler->SetConnection(conn);
+        handler->OwnName(conn);
+        g_object_unref(conn);
+      },
+      self.forget().take());
+  g_free(address);
 
   mInitialized = true;
   return true;
 }
 
-MPRISServiceHandler::MPRISServiceHandler() = default;
+MPRISServiceHandler::MPRISServiceHandler(uint32_t aInstanceId, uint32_t aTabId)
+    : mInstanceId(aInstanceId), mTabId(aTabId) {}
 MPRISServiceHandler::~MPRISServiceHandler() {
   MOZ_ASSERT(!mInitialized, "Close hasn't been called!");
+  if (mConnection) {
+    g_object_unref(mConnection);
+    mConnection = nullptr;
+  }
 }
 
 void MPRISServiceHandler::Close() {
@@ -439,10 +476,25 @@ void MPRISServiceHandler::Close() {
     g_bus_unown_name(mOwnerId);
   }
 
+  if (mConnection) {
+    g_object_unref(mConnection);
+    mConnection = nullptr;
+  }
+
   mIntrospectionData = nullptr;
 
   mInitialized = false;
   MediaControlKeySource::Close();
+}
+
+void MPRISServiceHandler::SetConnection(GDBusConnection* aConnection) {
+  if (aConnection) {
+    g_object_ref(aConnection);
+  }
+  if (mConnection) {
+    g_object_unref(mConnection);
+  }
+  mConnection = aConnection;
 }
 
 bool MPRISServiceHandler::IsOpened() const { return mInitialized; }
@@ -496,7 +548,8 @@ bool MPRISServiceHandler::PressKey(
 
 void MPRISServiceHandler::SetPlaybackState(
     dom::MediaSessionPlaybackState aState) {
-  LOGMPRIS("SetPlaybackState");
+  LOGMPRIS("SetPlaybackState: instanceId=%u tabId=%u state=%d", mInstanceId,
+           mTabId, (int)aState);
   if (mPlaybackState == aState) {
     return;
   }
@@ -531,6 +584,8 @@ GVariant* MPRISServiceHandler::GetPlaybackStatus() const {
 
 void MPRISServiceHandler::SetMediaMetadata(
     const dom::MediaMetadataBase& aMetadata) {
+  LOGMPRIS("SetMediaMetadata: instanceId=%u tabId=%u title='%s'", mInstanceId,
+           mTabId, NS_ConvertUTF16toUTF8(aMetadata.mTitle).get());
   // Reset the index of the next available image to be fetched in the artwork,
   // before checking the fetching process should be started or not. The image
   // fetching process could be skipped if the image being fetching currently is
@@ -825,7 +880,7 @@ GVariant* MPRISServiceHandler::GetMetadataAsGVariant() const {
   GVariantBuilder builder;
   g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
   g_variant_builder_add(&builder, "{sv}", "mpris:trackid",
-                        g_variant_new("o", DBUS_MPRIS_TRACK_PATH));
+                        g_variant_new_object_path(GetTrackPath()));
 
   g_variant_builder_add(
       &builder, "{sv}", "xesam:title",

@@ -4,6 +4,8 @@
 
 #include "MediaControlKeyManager.h"
 
+#include <cmath>
+
 #include "MediaControlService.h"
 #include "MediaControlUtils.h"
 #include "mozilla/AbstractThread.h"
@@ -47,10 +49,26 @@ void MediaControlKeyManager::Close() {
   StopMonitoringControlKeys();
 }
 
-MediaControlKeyManager::MediaControlKeyManager()
-    : mObserver(new Observer(this)) {
+MediaControlKeyManager::MediaControlKeyManager(uint64_t aTabId,
+                                               uint32_t aInstanceId)
+    : mTabId(aTabId),
+#if defined(MOZ_WIDGET_GTK)
+      mInstanceId(aInstanceId),
+#endif
+      mObserver(new Observer(this)) {
+#if !defined(MOZ_WIDGET_GTK)
+  (void)aInstanceId;
+#endif
   nsContentUtils::RegisterShutdownObserver(mObserver);
   Preferences::AddStrongObserver(mObserver, MEDIA_CONTROL_PREF);
+}
+
+MediaController* MediaControlKeyManager::GetTabController() const {
+  RefPtr<MediaControlService> service = MediaControlService::GetService();
+  if (!service) {
+    return nullptr;
+  }
+  return service->GetControllerByTabId(mTabId);
 }
 
 MediaControlKeyManager::~MediaControlKeyManager() { Shutdown(); }
@@ -71,7 +89,12 @@ bool MediaControlKeyManager::StartMonitoringControlKeys() {
   }
 
   if (!mEventSource) {
+#if defined(MOZ_WIDGET_GTK)
+    mEventSource = widget::CreateMediaControlKeySource(
+        mInstanceId, static_cast<uint32_t>(mTabId));
+#else
     mEventSource = widget::CreateMediaControlKeySource();
+#endif
   }
   if (mEventSource && mEventSource->Open()) {
     LOG_INFO("StartMonitoringControlKeys");
@@ -107,8 +130,64 @@ void MediaControlKeyManager::StopMonitoringControlKeys() {
 
 void MediaControlKeyManager::OnActionPerformed(
     const MediaControlAction& aAction) {
-  for (auto listener : mListeners) {
-    listener->OnActionPerformed(aAction);
+  // Route actions to the correct tab's MediaController
+  MediaController* controller = GetTabController();
+  if (!controller || aAction.mKey.isNothing()) {
+    return;
+  }
+  switch (aAction.mKey.value()) {
+    case MediaControlKey::Focus:
+      controller->Focus();
+      break;
+    case MediaControlKey::Play:
+      controller->Play();
+      break;
+    case MediaControlKey::Pause:
+      controller->Pause();
+      break;
+    case MediaControlKey::Playpause:
+      if (controller->IsPlaying()) {
+        controller->Pause();
+      } else {
+        controller->Play();
+      }
+      break;
+    case MediaControlKey::Previoustrack:
+      controller->PrevTrack();
+      break;
+    case MediaControlKey::Nexttrack:
+      controller->NextTrack();
+      break;
+    case MediaControlKey::Seekbackward: {
+      const SeekDetails& details = *aAction.mDetails;
+      MOZ_ASSERT(details.mRelativeSeekOffset);
+      controller->SeekBackward(
+          std::fmin(details.mRelativeSeekOffset.value(), 10.0));
+      break;
+    }
+    case MediaControlKey::Seekforward: {
+      const SeekDetails& details = *aAction.mDetails;
+      MOZ_ASSERT(details.mRelativeSeekOffset);
+      controller->SeekForward(
+          std::fmin(details.mRelativeSeekOffset.value(), 10.0));
+      break;
+    }
+    case MediaControlKey::Skipad:
+      controller->SkipAd();
+      break;
+    case MediaControlKey::Seekto: {
+      const SeekDetails& details = *aAction.mDetails;
+      MOZ_ASSERT(details.mAbsolute);
+      controller->SeekTo(details.mAbsolute->mSeekTime,
+                         details.mAbsolute->mFastSeek);
+      break;
+    }
+    case MediaControlKey::Stop:
+      controller->Stop();
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Error : undefined media key!");
+      break;
   }
 }
 

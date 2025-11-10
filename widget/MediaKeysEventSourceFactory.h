@@ -5,6 +5,8 @@
 #ifndef WIDGET_MEDIAKEYSEVENTSOURCEFACTORY_H_
 #define WIDGET_MEDIAKEYSEVENTSOURCEFACTORY_H_
 
+// Needed for uint32_t
+#include <cstdint>
 namespace mozilla {
 namespace dom {
 class MediaControlKeySource;
@@ -16,7 +18,12 @@ namespace widget {
 
 // This function declaration is used to create a media keys event source on
 // different platforms, each platform should have their own implementation.
+#if defined(MOZ_WIDGET_GTK)
+extern mozilla::dom::MediaControlKeySource* CreateMediaControlKeySource(
+    uint32_t instanceId, uint32_t tabId);
+#else
 extern mozilla::dom::MediaControlKeySource* CreateMediaControlKeySource();
+#endif
 
 }  // namespace widget
 }  // namespace mozilla

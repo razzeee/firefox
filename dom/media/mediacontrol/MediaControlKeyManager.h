@@ -6,6 +6,7 @@
 #define DOM_MEDIA_MEDIACONTROL_MEDIACONTROLKEYMANAGER_H_
 
 #include "MediaControlKeySource.h"
+#include "MediaController.h"
 #include "MediaEventSource.h"
 #include "nsIObserver.h"
 
@@ -22,9 +23,11 @@ namespace mozilla::dom {
 class MediaControlKeyManager final : public MediaControlKeySource,
                                      public MediaControlKeyListener {
  public:
+  MediaController* GetTabController() const;
+
   NS_INLINE_DECL_REFCOUNTING(MediaControlKeyManager, override)
 
-  MediaControlKeyManager();
+  MediaControlKeyManager(uint64_t aTabId, uint32_t aInstanceId);
 
   // MediaControlKeySource methods
   bool Open() override;
@@ -46,6 +49,10 @@ class MediaControlKeyManager final : public MediaControlKeySource,
  private:
   ~MediaControlKeyManager();
   void Shutdown();
+  uint64_t mTabId;
+#if defined(MOZ_WIDGET_GTK)
+  uint32_t mInstanceId;
+#endif
 
   class Observer final : public nsIObserver {
    public:
