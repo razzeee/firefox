@@ -5,6 +5,8 @@
 #ifndef DOM_MEDIA_MEDIACONTROL_MEDIACONTROLSERVICE_H_
 #define DOM_MEDIA_MEDIACONTROL_MEDIACONTROLSERVICE_H_
 
+#include <unordered_map>
+
 #include "AudioFocusManager.h"
 #include "MediaControlKeyManager.h"
 #include "MediaController.h"
@@ -27,6 +29,8 @@ namespace mozilla::dom {
  */
 class MediaControlService final : public nsIObserver {
  public:
+  MediaController* GetControllerByTabId(uint64_t tabId) const;
+
   NS_DECL_ISUPPORTS
   NS_DECL_NSIOBSERVER
 
@@ -41,9 +45,8 @@ class MediaControlService final : public nsIObserver {
       GlobalObject& aGlobal);
 
   AudioFocusManager& GetAudioFocusManager() { return mAudioFocusManager; }
-  MediaControlKeySource* GetMediaControlKeySource() {
-    return mMediaControlKeyManager;
-  }
+  // No global MediaControlKeyManager; only per-tab managers are used.
+  MediaControlKeySource* GetMediaControlKeySource() { return nullptr; }
 
   // Use these functions to register/unresgister controller to/from the active
   // controller list in the service. Return true if the controller is registered
@@ -99,6 +102,7 @@ class MediaControlService final : public nsIObserver {
    */
   class ControllerManager final {
    public:
+    const LinkedList<RefPtr<MediaController>>& GetControllers() const;
     explicit ControllerManager(MediaControlService* aService);
     ~ControllerManager() = default;
 
@@ -111,15 +115,17 @@ class MediaControlService final : public nsIObserver {
     bool RemoveController(MediaController* aController);
     void UpdateMainControllerIfNeeded(MediaController* aController);
 
+    MediaController* GetControllerById(uint64_t aTabId) const;
+
     void Shutdown();
 
     MediaController* GetMainController() const;
     bool Contains(MediaController* aController) const;
     uint64_t GetControllersNum() const;
 
-    // These functions are used for monitoring main controller's status change.
-    void MainControllerPlaybackStateChanged(MediaSessionPlaybackState aState);
-    void MainControllerMetadataChanged(const MediaMetadataBase& aMetadata);
+    // No-op: no global MPRIS instance to update.
+    void MainControllerPlaybackStateChanged(MediaSessionPlaybackState) {}
+    void MainControllerMetadataChanged(const MediaMetadataBase&) {}
 
    private:
     // When applying `eInsertAsMainController`, we would always insert the
@@ -142,26 +148,22 @@ class MediaControlService final : public nsIObserver {
 
     LinkedList<RefPtr<MediaController>> mControllers;
     RefPtr<MediaController> mMainController;
+    std::unordered_map<uint64_t, MediaController*> mControllerMap;
 
-    // These member are use to listen main controller's play state changes and
-    // update the playback state to the event source.
-    RefPtr<MediaControlKeySource> mSource;
-    MediaEventListener mMetadataChangedListener;
-    MediaEventListener mSupportedKeysChangedListener;
-    MediaEventListener mFullScreenChangedListener;
-    MediaEventListener mPictureInPictureModeChangedListener;
-    MediaEventListener mPositionChangedListener;
+    // No global MediaControlKeySource; all per-tab logic is handled in
+    // mTabManagers.
   };
 
   void Init();
   void Shutdown();
 
   AudioFocusManager mAudioFocusManager;
-  RefPtr<MediaControlKeyManager> mMediaControlKeyManager;
   RefPtr<MediaControlKeyListener> mMediaKeysHandler;
   MediaEventProducer<uint64_t> mMediaControllerAmountChangedEvent;
   UniquePtr<ControllerManager> mControllerManager;
   nsString mFallbackTitle;
+  // Map of tabId to per-tab MediaControlKeyManager
+  std::unordered_map<uint64_t, RefPtr<MediaControlKeyManager>> mTabManagers;
 
   // Used for telemetry probe.
   void UpdateTelemetryUsageProbe();
