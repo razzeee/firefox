@@ -515,7 +515,7 @@ var ctrlTab = {
       this._buildPreviews();
     }
     this.canvasWidth = Math.ceil(
-      (screen.availWidth * 0.85) / this.previewsPerRow
+      (window.innerWidth * 0.85) / this.previewsPerRow
     );
     this.canvasHeight = Math.round(this.canvasWidth * tabPreviews.aspectRatio);
     this.updatePreviews();
@@ -534,16 +534,17 @@ var ctrlTab = {
     tabPreviewPanelHelper.opening(this);
 
     let width = Math.min(
-      screen.availWidth * 0.99,
+      window.innerWidth * 0.99,
       this.canvasWidth * 1.25 * this.previewColumnCount
     );
     this.panel.style.width = width + "px";
     let previewRows = Math.ceil(this.tabPreviewCount / this.previewsPerRow);
     var estimateHeight = this.canvasHeight * 1.25 * previewRows + 75;
-    this.panel.openPopupAtScreen(
-      screen.availLeft + (screen.availWidth - width) / 2,
-      screen.availTop + (screen.availHeight - estimateHeight) / 2,
-      false
+    this.panel.openPopup(
+      document.documentElement,
+      "overlap",
+      Math.max(0, (document.documentElement.clientWidth - width) / 2),
+      Math.max(0, (document.documentElement.clientHeight - estimateHeight) / 2)
     );
   },
 
